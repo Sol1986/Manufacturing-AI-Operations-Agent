@@ -22,3 +22,6 @@ class OpsPilotState(TypedDict):
 
     agent_result: NotRequired[dict]
     final_response: NotRequired[str]
+
+    pending_request: NotRequired[dict | None]
+    clarification_resolved: NotRequired[bool]

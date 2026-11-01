@@ -1,5 +1,6 @@
 
 from dotenv import load_dotenv
+import re
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import (
@@ -16,7 +17,7 @@ from agents.equipment_agent import equipment_graph
 load_dotenv()
 
 llm = ChatOpenAI(
-    model="gpt-4.1-mini",
+    model="gpt-5-mini",
     temperature=0,
 )
 
@@ -198,26 +199,53 @@ The child graph then continues its approval workflow.
 This is why the parent graph needs a checkpointer.
 '''
 
-# Create the clarification node
+
 def ask_for_clarification(state: OpsPilotState) -> dict:
-    if not state.get("machine_id"):
-        message = (
-            "Which machine would you like me to check? "
-            "Please provide its machine ID."
-        )
+    missing_fields = state["missing_fields"]
 
-    elif state.get("intent") == "action" and not state.get("issue"):
-        message = (
-            "What maintenance issue should the work order address?"
-        )
+    response = llm.invoke(
+        f"""
+        You are OpsPilot, a manufacturing operations assistant.
 
-    else:
-        message = (
-            "Could you clarify what you want OpsPilot to do?"
-        )
+        Original request: {state["user_request"]}
+        Intended task: {state["intent"]}
+        Missing information: {missing_fields}
+
+        Ask one concise, specific question that obtains
+        the missing information needed to continue.
+
+        Do not guess missing values.
+        Do not execute the user's request.
+        """
+    )
 
     return {
-        "final_response": message
+        "pending_request": {
+            "intent": state["intent"],
+            "issue": state.get("issue"),
+            "missing_fields": missing_fields,
+        },
+        "final_response": response.content,
+    }
+
+# This node checks whether the user is answering a previous question.
+def resolve_clarification(state: OpsPilotState) -> dict:
+    pending = state.get("pending_request")
+
+    if not pending:
+        return {}
+
+    machine_id = state["user_request"].strip().upper()
+
+    if not re.fullmatch(r"M-\d+", machine_id):
+        return {}
+
+    return {
+        "intent": pending["intent"],
+        "issue": pending.get("issue"),
+        "machine_id": machine_id,
+        "pending_request": None,
+        "clarification_resolved": True,
     }
 
 # Create the final response composer
@@ -266,6 +294,11 @@ def compose_response(state: OpsPilotState) -> dict:
         "final_response": response
     }
 
+def route_after_clarification(state: OpsPilotState) -> str:
+    if state.get("clarification_resolved"):
+        return "resolved"
+
+    return "new_request"
 
 # Build the complete supervisor graph
 from langgraph.graph import StateGraph, START, END
@@ -277,30 +310,32 @@ builder = StateGraph(OpsPilotState)
 
 builder.add_node("classify", classify_intent)
 builder.add_node("validate", validate_request)
-
 builder.add_node("equipment_agent", run_equipment_agent)
-
 builder.add_node("investigation_agent", run_investigation_agent)
-
 builder.add_node("prepare_action", prepare_action)
-
 builder.add_node("maintenance_action", run_maintenance_action)
+builder.add_node("clarify", ask_for_clarification)
+builder.add_node("compose_response", compose_response)
+builder.add_node("resolve_clarification", resolve_clarification)
 
-builder.add_node(
-    "clarify",
-    ask_for_clarification,
+# Start by checking for an unfinished request.
+builder.add_edge(START, "resolve_clarification")
+
+# If the user completed a pending request, skip classification.
+# Otherwise, classify the new request normally.
+builder.add_conditional_edges(
+    "resolve_clarification",
+    route_after_clarification,
+    {
+        "resolved": "validate",
+        "new_request": "classify",
+    },
 )
 
-builder.add_node(
-    "compose_response",
-    compose_response,
-)
-
-
-builder.add_edge(START, "classify")
+# Classify a new request, then validate it.
 builder.add_edge("classify", "validate")
 
-
+# Route the validated request.
 builder.add_conditional_edges(
     "validate",      # 1. STARTING POINT: When the "validate" node finishes running...
     route_intent,    # 2. THE DECISION MAKER: Run this Python function to figure out the user's goal...
@@ -312,30 +347,18 @@ builder.add_conditional_edges(
     },
 )
 
+# Maintenance action workflow.
+builder.add_edge("prepare_action", "maintenance_action")
 
-builder.add_edge(
-    "prepare_action",
-    "maintenance_action",
-)
+# Specialized agents return to the Supervisor response node.
+builder.add_edge("equipment_agent", "compose_response")
+builder.add_edge("investigation_agent", "compose_response")
+builder.add_edge("maintenance_action", "compose_response")
 
-
-builder.add_edge(
-    "equipment_agent",
-    "compose_response",
-)
-
-builder.add_edge(
-    "investigation_agent",
-    "compose_response",
-)
-
-builder.add_edge(
-    "maintenance_action",
-    "compose_response",
-)
-
-
+# Clarification returns a question to the user.
 builder.add_edge("clarify", END)
+
+# Completed requests end after composing a response.
 builder.add_edge("compose_response", END)
 
 
