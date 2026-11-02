@@ -6,9 +6,11 @@ build/
 dist/
 wheels/
 *.egg-info
-old/
 uv.lock
 
 # Virtual environments
 .venv
 .env
+
+# files
+ZTEMPLATE_LANGGRAPH

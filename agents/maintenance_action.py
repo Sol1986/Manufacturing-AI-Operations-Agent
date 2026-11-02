@@ -1,9 +1,18 @@
-
-from typing import Literal, NotRequired, TypedDict
+#--------------------------------------------
+# IMPORTS & CONFIGURATION
+#--------------------------------------------
+from typing import NotRequired, TypedDict
 
 from langgraph.graph import StateGraph, START, END
-from pydantic import BaseModel, ConfigDict, Field
+from schemas import ApprovalDecision
+from langgraph.types import interrupt
 
+from tools.work_orders import create_work_order
+
+
+#--------------------------------------------
+# STATE
+#--------------------------------------------
 # Define the maintenance action state
 class ActionState(TypedDict):
     request_id: str
@@ -19,43 +28,14 @@ class ActionState(TypedDict):
     work_order_id: NotRequired[str]
     final_result: NotRequired[dict]
 
+#--------------------------------------------
+# TOOLS 
+#--------------------------------------------
+#NA
 
-# Define the approval schema
-class WorkOrderChanges(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    priority: Literal[
-        "low",
-        "medium",
-        "high",
-    ] | None = None
-
-    estimated_minutes: int | None = Field(
-        default=None,
-        ge=15,
-        le=480,
-    )
-
-    action: str | None = Field(
-        default=None,
-        min_length=5,
-        max_length=200,
-    )
-
-
-class ApprovalDecision(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    action: Literal[
-        "approve",
-        "reject",
-        "edit",
-    ]
-
-    changes: WorkOrderChanges | None = None
-
-    reviewer_id: str = Field(min_length=1)
-
+#--------------------------------------------
+# NODES
+#--------------------------------------------
 
 # Create the proposal node. The first node prepares the work order.
 def prepare_work_order(state: ActionState) -> dict:
@@ -64,7 +44,7 @@ def prepare_work_order(state: ActionState) -> dict:
         "machine_id": state["machine_id"],
         "issue": state["issue"],
         "priority": state["priority"],
-        "action": "Inspect and repair the cooling system.",
+        "action": "Inspect and repair.",
         "estimated_minutes": 120,
     }
 
@@ -73,13 +53,7 @@ def prepare_work_order(state: ActionState) -> dict:
         "status": "awaiting_approval",
     }
 
-
-
-from langgraph.types import interrupt
-
-# Create the human approval node
-# 1. This defines a standard Python function named 'request_approval'.
-# It takes in the current graph memory ('state') and promises to return a dictionary ('-> dict').
+# Create the approval node. This node handles the approval process.
 def request_approval(state: ActionState) -> dict:
 
     # 2. This creates a hard breakpoint. The entire AI agent FREEZES right here. 
@@ -117,20 +91,6 @@ def request_approval(state: ActionState) -> dict:
     }
 
 
-
-# Route the approval decision
-def route_decision(state: ActionState) -> str:
-    action = state["approval_action"]
-
-    if action == "approve":
-        return "execute"
-
-    if action == "reject":
-        return "reject"
-
-    return "revise"
-
-
 # Handle proposal edits
 def revise_proposal(state: ActionState) -> dict:
     decision = state["approval_decision"]
@@ -151,10 +111,7 @@ def revise_proposal(state: ActionState) -> dict:
         "status": "awaiting_approval",
     }
 
-
-from old.work_orders import create_work_order
-
-# Create the execution node
+# Create the execution node. This node creates the work order in the database.
 def execute_work_order(state: ActionState) -> dict:
     if state["approval_action"] != "approve":
         raise ValueError(
@@ -172,14 +129,13 @@ def execute_work_order(state: ActionState) -> dict:
     }
 
 
-# Create the rejection node
+# Create the rejection node. This node handles the rejection of the work order.
 def reject_work_order(state: ActionState) -> dict:
     return {
         "status": "rejected",
     }
 
-
-# Create the final result node
+# Create the finalization node. This node prepares the final result to return to the user.
 def finalize_action(state: ActionState) -> dict:
     result = {
         "request_id": state["request_id"],
@@ -191,10 +147,24 @@ def finalize_action(state: ActionState) -> dict:
     return {
         "final_result": result
     }
+#--------------------------------------------
+# EDGES & ROUTING
+#--------------------------------------------
+# Route the approval decision
+def route_decision(state: ActionState) -> str:
+    action = state["approval_action"]
 
+    if action == "approve":
+        return "execute"
 
+    if action == "reject":
+        return "reject"
 
-# Now connect everything.
+    return "revise"
+
+#--------------------------------------------
+# GRAPH ASSEMBLY
+#--------------------------------------------
 builder = StateGraph(ActionState)
 
 builder.add_node("prepare", prepare_work_order)
@@ -228,3 +198,7 @@ builder.add_edge("finalize", END)
 
 maintenance_action_graph = builder.compile()
 
+#--------------------------------------------
+# ENTRYPOINT
+#--------------------------------------------
+#NA

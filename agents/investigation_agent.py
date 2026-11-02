@@ -1,10 +1,15 @@
-
+#--------------------------------------------
+# IMPORTS & CONFIGURATION
+#--------------------------------------------
 from typing import Annotated, NotRequired, TypedDict
 import operator
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from langgraph.graph import StateGraph, START, END
+from tools.equipment_db import EQUIPMENT_DB, PRODUCTION_DB, MAINTENANCE_DB, INCIDENT_DB
 
-
+#--------------------------------------------
+# STATE
+#--------------------------------------------
 class InvestigationState(TypedDict):
     machine_id: str
 
@@ -17,65 +22,28 @@ class InvestigationState(TypedDict):
 
     investigation_report: NotRequired[dict]
 
-
 # Now we need to combine the findings into one structured report.
 # We'll use a Pydantic model to validate the report's structure.
-
-
 class InvestigationReport(BaseModel):
     machine_id: str
     findings: list[dict]
     risk_level: str
     recommendation: str
-    evidence_sources: list[str] = Field(
-        default_factory=list # If someone creates this object without specifying any evidence sources, automatically run the list() function to generate a fresh, empty list [] for them.
-    )
+    evidence_sources: list[str]
 
-'''
-With the default: You can safely initialize your agent state with just the user's query (AgentState(query="Hello")). 
-Pydantic quietly builds the empty list [] behind the scenes, keeping your code running smoothly.
-'''
-
-# Create our simulated manufacturing data
-EQUIPMENT_DB = {
-    "M-103": {
-        "status": "Maintenance Required",
-        "temperature_c": 85.5,
-    }
-}
-
-MAINTENANCE_DB = {
-    "M-103": {
-        "recent_repairs": 3,
-        "recurring_issue": "Cooling system",
-    }
-}
-
-PRODUCTION_DB = {
-    "M-103": {
-        "target_units": 1000,
-        "actual_units": 820,
-        "downtime_minutes": 95,
-    }
-}
-
-INCIDENT_DB = {
-    "M-103": {
-        "recent_incidents": 2,
-        "incident_type": "Overheating",
-    }
-}
-
-# Build the four parallel investigation nodes
-import asyncio
+#--------------------------------------------
+# TOOLS 
+#--------------------------------------------
+#NA
 
 
-async def check_equipment( # The node reads machine_id, retrieves the equipment record, and returns two state updates.
-    state: InvestigationState,
-) -> dict:
+#--------------------------------------------
+# NODES
+#--------------------------------------------
+
+# # The node reads machine_id, retrieves the equipment record, and returns two state updates.
+async def check_equipment(state: InvestigationState) -> dict:
     machine_id = state["machine_id"]
-
-    await asyncio.sleep(1)
 
     equipment = EQUIPMENT_DB[machine_id]
 
@@ -86,21 +54,22 @@ async def check_equipment( # The node reads machine_id, retrieves the equipment 
                 "source": "equipment",
                 "detail": (
                     f"Temperature is "
-                    f"{equipment['temperature_c']}°C."
+                    f"{equipment['temperature']}°C."
                 ),
             }
         ],
     }
 
-# Now maintenance:
-async def check_maintenance(
-    state: InvestigationState,
-) -> dict:
+# # The node reads machine_id, retrieves the maintenance record, and returns two state updates.
+async def check_maintenance(state: InvestigationState) -> dict:
     machine_id = state["machine_id"]
 
-    await asyncio.sleep(1)
-
     maintenance = MAINTENANCE_DB[machine_id]
+
+    repair_count = sum(
+            record["type"] == "repair"
+            for record in maintenance["history"]
+        )
 
     return {
         "maintenance_data": maintenance,
@@ -108,20 +77,18 @@ async def check_maintenance(
             {
                 "source": "maintenance",
                 "detail": (
-                    "Recurring cooling system issue "
-                    "with three recent repairs."
+                    f"Recurring {maintenance['recurring_issue']} issue "
+                    f"with {repair_count} recent repairs."
                 ),
             }
         ],
     }
 
-# Production:
+# # The node reads machine_id, retrieves the incident record, and returns two state updates.
 async def check_production(
     state: InvestigationState,
 ) -> dict:
     machine_id = state["machine_id"]
-
-    await asyncio.sleep(1)
 
     production = PRODUCTION_DB[machine_id]
 
@@ -145,13 +112,8 @@ async def check_production(
         ],
     }
 
-# And incidents:
-async def check_incidents(
-    state: InvestigationState,
-) -> dict:
+async def check_incidents(state: InvestigationState) -> dict:
     machine_id = state["machine_id"]
-
-    await asyncio.sleep(1)
 
     incidents = INCIDENT_DB[machine_id]
 
@@ -161,25 +123,14 @@ async def check_incidents(
             {
                 "source": "incidents",
                 "detail": (
-                    "Two recent overheating "
+                    f"Two recent {incidents['incident_type'].lower()} "
                     "incidents were recorded."
                 ),
             }
         ],
     }
 
-'''
-Each node:
-1. Receives the same InvestigationState.
-2. Reads the machine ID.
-3. Performs an independent lookup.
-4. Returns its own structured data.
-5. Appends one finding.
-'''
-
-
-
-# Now create the aggregation node:
+# Combine the four research branches into a single report.
 def combine_evidence(state: InvestigationState) -> dict:
     """Combine the four research branches."""
 
@@ -193,22 +144,41 @@ def combine_evidence(state: InvestigationState) -> dict:
         key=lambda item: item["source"],
     )
 
-    if (
-        equipment["temperature_c"] >= 85
-        and incidents["recent_incidents"] >= 2
-    ):
+    decline_pct = (
+        (production["target_units"] - production["actual_units"])
+        / production["target_units"]
+    ) * 100
+
+    repair_count = sum(
+        record["type"] == "repair"
+        for record in maintenance["history"]
+    )
+
+
+    risk_factors = sum([
+        equipment["temperature"] >= 85,
+        incidents["recent_incidents"] >= 2,
+        repair_count >= 3,
+        decline_pct >= 10,
+    ])
+
+    if risk_factors >= 3:
         risk_level = "high"
-    else:
+    elif risk_factors >= 1:
         risk_level = "medium"
+    else:
+        risk_level = "low"
+
 
     report = InvestigationReport(
         machine_id=state["machine_id"],
         findings=findings,
         risk_level=risk_level,
         recommendation=(
-            "Schedule a maintenance review of the "
-            "cooling system and temperature sensors."
+            "Schedule a maintenance review of: "
+            f"{maintenance['recurring_issue']}."
         ),
+
         evidence_sources=[
             "equipment",
             "maintenance",
@@ -220,8 +190,14 @@ def combine_evidence(state: InvestigationState) -> dict:
     return {
         "investigation_report": report.model_dump()
     }
+#--------------------------------------------
+# EDGES & ROUTING
+#--------------------------------------------
+#NA
 
-# Build the Investigation Agent subgraph
+#--------------------------------------------
+# GRAPH ASSEMBLY
+#--------------------------------------------
 builder = StateGraph(InvestigationState)
 
 builder.add_node("equipment", check_equipment)
@@ -230,16 +206,14 @@ builder.add_node("production", check_production)
 builder.add_node("incidents", check_incidents)
 builder.add_node("combine", combine_evidence)
 
-
 # Fan-out
 builder.add_edge(START, "equipment")
 builder.add_edge(START, "maintenance")
 builder.add_edge(START, "production")
 builder.add_edge(START, "incidents")
 
-
 # Fan-in: wait for all four branches
-builder.add_edge( # It creates a waiting edge. And because the branches are asynchronous, their simulated one-second waits can overlap.
+builder.add_edge( # This creates a waiting edge.
     [
         "equipment",
         "maintenance",
@@ -249,10 +223,10 @@ builder.add_edge( # It creates a waiting edge. And because the branches are asyn
     "combine",
 )
 
-
 builder.add_edge("combine", END)
 
 investigation_graph = builder.compile()
-
-
-
+#--------------------------------------------
+# ENTRYPOINT
+#--------------------------------------------
+#NA

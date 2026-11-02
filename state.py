@@ -1,19 +1,13 @@
-
 from typing import Literal, NotRequired, TypedDict
+class State(TypedDict):
+    user_request: str
 
-
-Intent = Literal[
+    intent: NotRequired[Literal[
     "equipment",
     "investigation",
     "action",
     "clarify",
-]
-
-# Define the parent state
-class OpsPilotState(TypedDict):
-    user_request: str
-
-    intent: NotRequired[Intent]
+]]
     machine_id: NotRequired[str]
 
     request_id: NotRequired[str]
@@ -25,3 +19,6 @@ class OpsPilotState(TypedDict):
 
     pending_request: NotRequired[dict | None]
     clarification_resolved: NotRequired[bool]
+    missing_fields: NotRequired[list[str]]
+    last_machine_id: NotRequired[str]
+

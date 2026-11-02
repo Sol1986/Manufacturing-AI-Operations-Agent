@@ -1,109 +1,87 @@
+#--------------------------------------------
+# IMPORTS & CONFIGURATION
+#--------------------------------------------
+from typing import Annotated, NotRequired, TypedDict
 
-from typing import TypedDict, NotRequired
-
+from dotenv import load_dotenv
+from langchain_core.messages import AnyMessage, HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode, tools_condition
 
-#Define the Equipment Agent's state
+from tools.equipment_tools import get_equipment_details, get_maintenance_history
+
+load_dotenv()
+
+tools = [get_equipment_details, get_maintenance_history]
+
+llm = ChatOpenAI(model="gpt-5-mini", temperature=0)
+
+#--------------------------------------------
+# STATE
+#--------------------------------------------
 class EquipmentState(TypedDict):
     machine_id: str
+    user_request: str
 
-    equipment_data: NotRequired[dict]
-    maintenance_required: NotRequired[bool]
+    messages: Annotated[list[AnyMessage], add_messages]
     equipment_summary: NotRequired[str]
 
+#--------------------------------------------
+# NODES
+#--------------------------------------------
+# The LLM either requests a tool call or writes the final answer.
+def call_model(state: EquipmentState) -> dict:
+    instructions = SystemMessage(
+        content=(
+            "You are the equipment agent for OpsPilot, "
+            "a manufacturing operations assistant.\n\n"
+            f"The machine in question is {state['machine_id']}.\n"
+            "Use your tools to look up the information you need. "
+            "Answer only from tool results. "
+            "If a tool reports that a record does not exist, say so."
+        )
+    )
 
-EQUIPMENT_DB = {
-    "M-103": {
-        "machine_id": "M-103",
-        "name": "CNC Milling Machine",
-        "status": "Maintenance Required",
-        "temperature": 85.5,
-    },
-    "M-104": {
-        "machine_id": "M-104",
-        "name": "Hydraulic Press",
-        "status": "Operational",
-        "temperature": 62.3,
-    },
-    "M-105": {
-        "machine_id": "M-105",
-        "name": "Industrial Conveyor",
-        "status": "Offline",
-        "temperature": 25.0,
-    },
-}
+    response = llm.bind_tools(tools).invoke(
+        [
+            instructions,
+            HumanMessage(content=state["user_request"]),
+            *state.get("messages", []),
+        ]
+    )
 
-# Create the equipment lookup node
-def lookup_equipment(state: EquipmentState) -> dict:
-    machine_id = state["machine_id"]
+    return {"messages": [response]}
 
-    equipment = EQUIPMENT_DB.get(machine_id)
 
-    if equipment is None:
-        return {
-            "equipment_data": {
-                "machine_id": machine_id,
-                "status": "Not Found",
-            }
-        }
-
-    return {
-        "equipment_data": dict(equipment)
-    }
-
-# Create the equipment assessment node
-def assess_equipment(state: EquipmentState) -> dict:
-    equipment = state["equipment_data"]
-
-    status = equipment["status"]
-
-    maintenance_required = status in {
-        "Maintenance Required",
-        "Offline",
-    }
-
-    return {
-        "maintenance_required": maintenance_required
-    }
-
-# Create the summary node
+# Save the LLM's final answer where run_equipment_agent expects it.
 def summarize_equipment(state: EquipmentState) -> dict:
-    equipment = state["equipment_data"]
-
-    machine_id = state["machine_id"]
-    status = equipment["status"]
-
-    if status == "Not Found":
-        summary = (
-            f"Machine {machine_id} was not found."
-        )
-
-    elif state["maintenance_required"]:
-        summary = (
-            f"Machine {machine_id} has status '{status}' "
-            "and requires maintenance review."
-        )
-
-    else:
-        summary = (
-            f"Machine {machine_id} is operational."
-        )
-
     return {
-        "equipment_summary": summary
+        "equipment_summary": state["messages"][-1].content
     }
 
-# Compile the Equipment Agent
-
+#--------------------------------------------
+# GRAPH ASSEMBLY
+#--------------------------------------------
 builder = StateGraph(EquipmentState)
 
-builder.add_node("lookup", lookup_equipment)
-builder.add_node("assess", assess_equipment)
+builder.add_node("call_model", call_model)
+builder.add_node("tools", ToolNode(tools))
 builder.add_node("summarize", summarize_equipment)
 
-builder.add_edge(START, "lookup")
-builder.add_edge("lookup", "assess")
-builder.add_edge("assess", "summarize")
+builder.add_edge(START, "call_model")
+
+builder.add_conditional_edges(
+    "call_model",
+    tools_condition,
+    {
+        "tools": "tools",
+        END: "summarize",
+    },
+)
+
+builder.add_edge("tools", "call_model")
 builder.add_edge("summarize", END)
 
 equipment_graph = builder.compile()

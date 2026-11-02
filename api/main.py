@@ -179,6 +179,40 @@ async def submit_approval(
         result,
     )
 
+# Send a follow-up message to an existing thread
+@app.post("/threads/{thread_id}/messages")
+async def add_message(thread_id: str, request: OpsPilotRequest):
+    config = {
+        "configurable": {
+            "thread_id": thread_id,
+        }
+    }
+
+    snapshot = graph.get_state(config)
+
+    if not snapshot.values:
+        raise HTTPException(
+            status_code=404,
+            detail="Thread not found.",
+        )
+
+    if any(task.interrupts for task in snapshot.tasks):
+        raise HTTPException(
+            status_code=409,
+            detail="Workflow is awaiting approval.",
+        )
+
+    result = await graph.ainvoke(
+        {"user_request": request.message},
+        config=config,
+    )
+
+    return format_graph_result(
+        thread_id,
+        result,
+    )
+
+
 # Create the state inspection endpoint
 @app.get("/threads/{thread_id}")
 def get_thread_state(thread_id: str):

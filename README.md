@@ -1,6 +1,6 @@
 # 🏭 OpsPilot — Manufacturing Operations AI Agent
 
-OpsPilot is a manufacturing operations assistant that turns natural-language requests into equipment status summaries, investigations, and maintenance work-order proposals. A LangGraph supervisor classifies each request, validates the required information, and routes it to a specialist subgraph. Investigations collect evidence across four parallel branches, while maintenance actions pause for human approval before a work order can be created.
+OpsPilot is a manufacturing operations assistant that turns natural-language requests into equipment answers, maintenance-history summaries, investigations, and maintenance work-order proposals. A LangGraph supervisor resolves follow-up questions, classifies intent, validates required information, and delegates work to specialist subgraphs. The Equipment Agent uses LLM tool calling, the Investigation Agent combines four evidence branches, and the Maintenance Action Agent pauses for human approval before creating a work order. Use the FastAPI endpoints or the interactive command-line interface to continue a conversation on the same thread.
 
 Built with **LangGraph**, **FastAPI**, and **OpenAI**, the project demonstrates structured intent classification, conditional routing, parallel evidence collection, separate subgraph state, and resumable human approval over HTTP.
 
@@ -12,14 +12,15 @@ Built with **LangGraph**, **FastAPI**, and **OpenAI**, the project demonstrates 
 
 | Capability | How it works |
 |---|---|
-| ⚙️ **Equipment status** | Retrieves a machine record, assesses whether maintenance review is needed, and returns a summary. |
-| 🔎 **Investigation** | Checks equipment, maintenance, production, and incidents in parallel, then combines the findings into a structured report. |
-| 🛠️ **Maintenance actions** | Prepares a work-order proposal and waits for a person to approve, reject, or edit it. |
-| 💬 **Clarification** | Adds LLM-written questions and a pending-request resolver; end-to-end wiring is still in progress. |
-| 🌐 **HTTP access** | Exposes request submission, approval, state inspection, health, and streaming endpoints. |
-| 🧠 **Workflow state** | Tracks requests under generated thread IDs and supports approval resumption within the running server process. |
+| ⚙️ **Equipment information** | Uses an LLM tool loop to retrieve machine details and answer from tool results. |
+| 📋 **Maintenance history** | Calls the maintenance-history tool for dated service records and recurring issues. |
+| 🔎 **Investigation** | Collects equipment, maintenance, production, and incident evidence in four graph branches, then applies a risk score. |
+| 🛠️ **Maintenance actions** | Prepares a work-order proposal and waits for approval, rejection, or edits. |
+| 💬 **Clarification and follow-ups** | Preserves incomplete requests, extracts missing information from replies, and carries recent machine context within a thread. |
+| 🌐 **HTTP and CLI access** | Supports API requests, existing-thread messages, approval decisions, state inspection, streaming, and an interactive terminal loop. |
+| 🧠 **Workflow state** | Uses process-local checkpoints and an in-memory work-order store. |
 
-The LLM interprets intent and now generates clarification questions. Application code enforces required fields, selects routes, applies investigation risk rules, and controls execution. Final specialist responses are currently formatted by Python.
+LLMs handle intent classification, clarification extraction, question generation, and equipment tool selection and answers. Python enforces routing, required fields, investigation risk rules, approval gates, and final response formatting.
 
 ## 🎯 Business Outcomes and Agent Design
 
@@ -33,42 +34,45 @@ So what are some ways we can optimize AI agents so that we can deliver business 
 
 The Supervisor Graph acts as the central orchestrator, receiving user requests, using an LLM to classify intent, validating required information, and routing tasks to the appropriate specialized subgraph. The Equipment Agent retrieves machine data, evaluates operating conditions, and identifies potential maintenance needs. The Investigation Agent performs deeper analysis by gathering evidence in parallel from equipment records, maintenance history, production performance, and incident reports, then combines the findings to identify potential root causes and recommend actions. The Maintenance Action Agent handles work-order creation, using human-in-the-loop approval to ensure no maintenance action is executed without authorization. Each subgraph manages its own internal nodes, tools, and state, then returns structured results to the Supervisor, which prepares the final response for the user.
 
-**How this maps to the current code:** The LLM handles intent classification and clarification wording. Specialist lookups, investigation aggregation and risk assessment, and `compose_response` use deterministic Python. The investigation currently produces a fixed recommendation from sample evidence; broader root-cause reasoning and LLM-generated final reports are design directions rather than implemented capabilities.
+**How this maps to the current code:** The Equipment Agent now uses an LLM to select tools and generate an answer from their results. The supervisor's request-handling module uses structured LLM outputs for classification and clarification extraction. Investigation aggregation, risk scoring, recommendation formatting, approval enforcement, and `compose_response` remain Python-controlled. Investigation reports summarize sample evidence; they do not establish a proven root cause.
 
 ## 🧰 Technology Stack
 
 | Component | Technology |
 |---|---|
 | Orchestration | LangGraph `StateGraph`, conditional edges, and specialist subgraphs |
-| Language understanding and clarification | OpenAI `gpt-5-mini` through `ChatOpenAI`; structured intent classification and LLM-written clarification questions |
+| Model | OpenAI `gpt-5-mini` through `ChatOpenAI` |
+| Structured extraction | Pydantic `IntentClassification` and `ClarificationAnswer` schemas |
+| Equipment tool loop | `bind_tools`, `ToolNode`, `tools_condition`, and the `add_messages` reducer |
 | API | FastAPI and Uvicorn |
-| Validation | Pydantic models and typed state schemas |
-| Parallel investigation | Asynchronous branches with an explicit join |
+| Evidence aggregation | Four asynchronous graph branches with an explicit join and `operator.add` findings reducer |
 | Human approval | LangGraph `interrupt()` and `Command(resume=...)` |
-| Active workflow checkpoints | `InMemorySaver` |
-| Companion storage helper | SQLite in `tools/work_orders_db.py`; see implementation notes |
+| Workflow checkpoints | `InMemorySaver` |
+| Work-order storage | In-memory dictionary, deduplicated by request ID within the running process |
 | Runtime | Python 3.12+ and `uv` |
 
 ---
 
 ## 🧭 Supervisor Workflow
 
-The supervisor now begins with `resolve_clarification`. If a message resolves a stored pending request, `route_after_clarification` skips classification and sends it to validation. Otherwise, the request follows the normal classify → validate → route path. The graph still handles one specialist intent at a time.
+The supervisor begins with `resolve_clarification`. For a known pending task, a structured LLM extractor checks whether the reply supplies missing information or starts a new request. A resolved task goes directly to validation. New requests are classified normally; an initially ambiguous pending request is combined with the reply and classified again. The graph handles one specialist intent per turn.
+
+`supervisor.py` now assembles the graph and formats results. Request-handling nodes and specialist adapters live in `request_validation.py`.
 
 ![Supervisor architecture with clarification resolution and parent state](docs/images/supervisor-architecture.png)
 
-> 📝 The supplied architecture image shows the intended clarification flow and evaluation areas. The Mermaid diagram below follows the registered supervisor edges; the remaining clarification wiring is described in the next section. The supplied action image also labels creation as idempotent; the active storage dependency remains unverified, as noted below.
+> 📝 The supplied images are design references. The current Mermaid diagrams and state definitions below reflect the inspected implementation; the equipment reference image shows an earlier linear workflow.
 
 ```mermaid
 flowchart TD
     userRequest(["1. User Request"])
     apiLayer["2. FastAPI: validate input and assign thread ID"]
-    resolveClarification["3. resolve_clarification: check pending request and supplied machine ID"]
+    resolveClarification["3. resolve_clarification: extract a reply or identify a new request"]
     routeClarification{"Previous request resolved?"}
     classifyIntent["4. classify_intent: identify intent, machine ID, issue, priority"]
     validateRequest["5. validate_request: check required information"]
     routeIntent{"6. route_intent"}
-    equipmentAgent[["Equipment Agent: status and machine information"]]
+    equipmentAgent[["Equipment Agent: tool-calling details and maintenance history"]]
     investigationAgent[["Investigation Agent: evidence, incidents, performance"]]
     prepareAction["prepare_action: request ID and default priority"]
     actionAgent[["Maintenance Action Agent: proposal and human approval"]]
@@ -99,86 +103,88 @@ flowchart TD
     class routeClarification,routeIntent,clarifyRequest decision;
 ```
 
-Clarification returns directly without `compose_response`. The action branch can pause for human approval before returning its final result. Diagram labels use function names; graph registration keys are sometimes shorter, such as `classify` and `validate`.
+Clarification returns its question directly without `compose_response`. The action branch can pause for approval before returning its final result. The graph registers `classify_intent`, `validate_request`, and `ask_for_clarification` under those same node names.
 
-## 🔄 State and Supervisor Updates
+## 🔄 Shared State and Conversation Handling
 
 ### Parent State in `state.py`
 
-The local parent schema now includes `pending_request` and `clarification_resolved`:
+The parent schema is now named `State` and is imported directly by the supervisor and request-handling module:
 
 ```python
-class OpsPilotState(TypedDict):
+class State(TypedDict):
     user_request: str
-
-    intent: NotRequired[Intent]
+    intent: NotRequired[Literal[
+        "equipment", "investigation", "action", "clarify"
+    ]]
     machine_id: NotRequired[str]
-
     request_id: NotRequired[str]
     issue: NotRequired[str]
     priority: NotRequired[str]
-
     agent_result: NotRequired[dict]
     final_response: NotRequired[str]
-
     pending_request: NotRequired[dict | None]
     clarification_resolved: NotRequired[bool]
+    missing_fields: NotRequired[list[str]]
+    last_machine_id: NotRequired[str]
 ```
 
-| Update | Behavior present in the code |
+| Field or node | Current behavior |
 |---|---|
-| `pending_request` | Holds the intent, issue, and missing-field list written by the clarification node, or `None` after resolution. |
-| `clarification_resolved` | Signals that the resolver filled in a machine ID and that classification can be skipped. |
-| `resolve_clarification` | Checks pending state, trims and uppercases the message, and accepts a bare machine ID matching `M-\d+`, such as `M-103`. |
-| `route_after_clarification` | Selects `validate` when resolved; otherwise selects `classify`. |
-| LLM clarification | `ask_for_clarification` asks one concise question using the original request, current intent, and missing fields. |
-| Model setting | The shared `ChatOpenAI` instance now specifies `gpt-5-mini`. |
+| `missing_fields` | Validation identifies missing machine IDs, missing action issues, or an unclear task without overwriting the classified intent. |
+| `pending_request` | Saves the original request, intent, machine ID, issue, priority, and missing-field list for a follow-up. |
+| `ClarificationAnswer` | Extracts `answers_question`, `machine_id`, and `issue` from a natural-language reply using structured output. |
+| `resolve_clarification` | Restores a known pending task from the answer, validates an extracted machine ID against `M-\d+`, and clears pending state before revalidation. |
+| New or unrelated reply | Drops a known pending task and classifies the new request; an initially ambiguous task is combined with its follow-up and reclassified. |
+| `clarification_resolved` | Resets to `False` when there is no pending request or the message needs classification; becomes `True` when a pending task is restored. |
+| `last_machine_id` | Gives the classifier recent machine context for explicit references such as “it” or “that machine.” |
 
-**Intended interaction:** A user submits an incomplete request, receives a targeted question, and answers with a machine ID on the same checkpointed thread. The resolver restores the pending task and continues validation without reclassifying that ID as a new standalone request.
+If a reply still leaves required information missing, validation routes back to a clarification question. The API now exposes `POST /threads/{thread_id}/messages` for these follow-ups. Clarification questions return `status: completed` while retaining `pending_request` in graph state; they are separate from approval interrupts.
 
-### Remaining Clarification Wiring
+### Interactive CLI
 
-The new nodes and local state fields are present, but the inspected files do not yet establish a working end-to-end clarification exchange:
-
-- `supervisor.py` still imports `OpsPilotState` from `old.state`, rather than the updated root `state.py`. The excluded folder was not inspected, so its state schema is unverified.
-- `ask_for_clarification` reads `state["missing_fields"]`, but the updated local state schema does not declare this field and `validate_request` does not populate it. The current path can therefore fail instead of returning a question.
-- Validation replaces an incomplete request's intent with `clarify`. The original specialist intent needs to be retained for the pending request to resume the intended task.
-- The resolver sets `clarification_resolved` to `True`, but the supervisor does not explicitly reset it for subsequent turns.
-- The HTTP request schema accepts only `message`, and `/requests` always generates a new thread ID. It cannot currently submit a clarification answer into the original thread; the approval endpoint resumes approval interrupts only.
-
-These are documentation findings. The state, supervisor, and API code were left unchanged.
+`main.py` keeps one thread ID for the entire terminal session, allowing clarification replies and references to the previously discussed machine. It prompts for `approve` or `reject` when a work order pauses. Use the HTTP approval endpoint when editing a proposal.
 
 ## ⚙️ Equipment Agent Subgraph
 
-**Triggered by:** a request for a machine's status or information.
+**Triggered by:** equipment details, status, or maintenance-history requests.
 
-![Equipment Agent subgraph and EquipmentState schema](docs/images/equipment-agent-subgraph.png)
+![Equipment Agent reference diagram from the earlier linear design](docs/images/equipment-agent-subgraph.png)
+
+*Design reference: the image predates the tool-calling loop. The current workflow is shown below.*
 
 ```mermaid
 flowchart TD
-    invokeEquipment["1. run_equipment_agent: parent invokes equipment subgraph"]
-    lookupEquipment["2. lookup_equipment: retrieve machine record"]
-    assessEquipment["3. assess_equipment: determine maintenance review need"]
-    summarizeEquipment["4. summarize_equipment: create equipment summary"]
-    returnEquipment["5. Return to supervisor: save summary in agent_result"]
+    invokeEquipment["1. run_equipment_agent: pass machine ID and user request"]
+    callModel["2. call_model: LLM reads the request and tool results"]
+    needsTools{"Tool calls requested?"}
+    executeTools["3. ToolNode: equipment details or maintenance history"]
+    summarizeEquipment["4. summarize_equipment: save the model's final answer"]
+    returnEquipment["5. Return summary in agent_result"]
     composeEquipment(["compose_response and final response"])
 
-    invokeEquipment --> lookupEquipment --> assessEquipment --> summarizeEquipment
+    invokeEquipment --> callModel --> needsTools
+    needsTools -->|"Yes"| executeTools
+    executeTools --> callModel
+    needsTools -->|"No"| summarizeEquipment
     summarizeEquipment --> returnEquipment --> composeEquipment
 
     classDef process fill:#dbeafe,stroke:#2563eb,color:#0f172a;
     classDef result fill:#dcfce7,stroke:#16a34a,color:#0f172a;
-    class lookupEquipment,assessEquipment,summarizeEquipment process;
-    class returnEquipment,composeEquipment result;
+    class callModel,executeTools process;
+    class summarizeEquipment,returnEquipment,composeEquipment result;
 ```
 
-**Example:** `What's the status of M-103?`
+`EquipmentState` contains `machine_id`, `user_request`, a `messages` list merged by `add_messages`, and the optional `equipment_summary`. Tool responses are added to the message history before the model decides whether to call another tool or answer.
 
-The agent retrieves M-103, sees `Maintenance Required`, and returns:
+| Tool | Result |
+|---|---|
+| `get_equipment_details` | Machine name, status, temperature, department, and installation year; a structured not-found result for an unknown ID. |
+| `get_maintenance_history` | Dated maintenance records and recurring issue; an error for an unknown machine. |
 
-> Machine M-103 has status 'Maintenance Required' and requires maintenance review.
+**Examples:** `What's the status of M-103?` and `Show maintenance history for M-104.`
 
-The subgraph includes **M-103**, **M-104**, and **M-105**. Both `Maintenance Required` and `Offline` trigger maintenance review. An unknown machine returns a not-found summary.
+Tools read the shared records in `tools/equipment_db.py`, which covers **M-103**, **M-104**, and **M-105**. The model is instructed to answer only from tool results and report missing records. Equipment answers are model-generated, so exact wording and selected tool calls can vary.
 
 ## 🔎 Investigation Agent Subgraph
 
@@ -226,9 +232,20 @@ flowchart TD
 
 Each branch appends a finding through the `operator.add` reducer. The join waits for all four branches, sorts findings by source, and creates a Pydantic-validated report containing `machine_id`, `findings`, `risk_level`, `recommendation`, and `evidence_sources`.
 
-The current rule assigns **high** risk when temperature is at least **85°C** and there are at least **2** recent incidents; otherwise it assigns **medium** risk. The recommendation is to review the cooling system and temperature sensors. This combines sample evidence and a fixed rule; it does not establish a proven root cause.
+Risk is now based on the number of these conditions that hold:
 
-> 📌 Investigation records currently cover **M-103 only**. Use M-103 for the investigation examples below.
+| Risk factor | Threshold |
+|---|---|
+| Equipment temperature | At least **85°C** |
+| Recent incidents | At least **2** |
+| Repair records in maintenance history | At least **3** |
+| Production shortfall | At least **10%** below target |
+
+**3–4 factors → high**, **1–2 factors → medium**, and **0 factors → low**. M-103 meets all four conditions. The recommendation names the recurring maintenance issue, for example `Schedule a maintenance review of: Cooling system.`
+
+The branches share the records in `tools/equipment_db.py`. They form a parallel fan-out/fan-in graph, although the current lookups are immediate local dictionary reads. The report combines evidence and deterministic rules rather than proving a root cause.
+
+> 📌 Use **M-103** for investigation examples. Other sample machines have null incident types, which the current incident formatter does not handle.
 
 ## 🛠️ Maintenance Action Agent Subgraph
 
@@ -270,7 +287,7 @@ flowchart TD
 
 **Example:** `Create a high-priority work order for M-103 to inspect the cooling system.`
 
-1. The parent assigns a request ID and defaults to `medium` priority if none was supplied.
+1. The parent assigns a new request ID for each action request and defaults to `medium` priority if none was supplied.
 2. The subgraph prepares the proposed machine, issue, priority, action, and estimated duration.
 3. `interrupt()` pauses execution and returns the proposal for review.
 4. A person submits **approve**, **reject**, or **edit** through the approval endpoint.
@@ -278,7 +295,9 @@ flowchart TD
 
 > 🔐 A work order is created only after a valid approval. Editing a proposal does not approve it.
 
-The initial proposal currently uses the fixed action **“Inspect and repair the cooling system.”** and an estimate of **120 minutes**. A reviewer can change `priority`, `estimated_minutes`, and `action` before approving.
+The initial proposal uses the supplied issue, the fixed action **“Inspect and repair.”**, and an estimate of **120 minutes**. A reviewer can change `priority`, `estimated_minutes`, and `action` before approving.
+
+Approved creation now calls `tools.work_orders.create_work_order`. Its in-memory dictionary returns the existing record for the same request ID, giving request-scoped duplicate prevention within the running process. Separate action requests receive different IDs, even if their wording is identical. Work orders are not durably stored.
 
 ## 🧠 How Graph State Moves Through the System
 
@@ -308,30 +327,29 @@ flowchart TD
 
 These are abbreviated snapshots. Each node returns a **partial state update**, which LangGraph merges according to the schema and any reducers.
 
-The parent `OpsPilotState` and each subgraph's private state are separate. Adapters pass required inputs into a child graph and copy its summary, report, or action result into the parent's `agent_result`. The action subgraph inherits checkpointing from the parent so approval can resume on the same thread.
+The parent `State` and each subgraph's private state are separate. Adapters pass required inputs into a child graph and copy its summary, report, or action result into the parent's `agent_result`. The action subgraph inherits checkpointing from the parent so approval can resume on the same thread.
 
 The active `InMemorySaver` holds checkpoints for inspection and resumption **within the running process**. Restarting the server clears workflow state.
 
 **New-request journey:** User → FastAPI → Resolve Clarification → Classify → Validate → Route → Specialist Subgraph → Return Result → Compose Response → User.
 
-**Resolved-clarification journey:** Same-thread user reply → Resolve Clarification → Validate → Route → Specialist Subgraph → Compose Response → User. This second journey describes the intended graph path; the HTTP and state-wiring gaps above still need to be addressed.
+**Resolved-clarification journey:** Existing-thread message → Resolve Clarification → Validate → Route → Specialist Subgraph → Compose Response → User. A reply to an initially ambiguous task goes through classification again.
 
 ---
 
 ## 📁 Project Structure
 
-The existing project layout is shown below. Virtual environments, caches, Git internals, and the excluded legacy folder are omitted.
+Current application files and documentation:
 
 ```text
 Ultimate LangGraph Agent/
 ├── agents/
-│   ├── __init__.py
-│   ├── equipment_agent.py       # Equipment lookup, assessment, and summary
-│   ├── investigation_agent.py   # Parallel branches and evidence aggregation
-│   └── maintenance_action.py    # Proposal, approval, revision, and execution
+│   ├── equipment_agent.py       # LLM tool-calling equipment subgraph
+│   ├── investigation_agent.py   # Four evidence branches and risk scoring
+│   └── maintenance_action.py    # Proposal, approval, revision, execution
 ├── api/
 │   ├── __init__.py
-│   └── main.py                  # FastAPI routes and response formatting
+│   └── main.py                  # FastAPI routes, messages, approvals, streaming
 ├── docs/
 │   └── images/
 │       ├── supervisor-architecture.png
@@ -340,26 +358,22 @@ Ultimate LangGraph Agent/
 │       └── maintenance-action-subgraph.png
 ├── evals/
 │   └── golden_dataset.py        # Example requests and expected intent labels
-├── tests/
-│   ├── integration_test.py      # Investigation workflow checks
-│   ├── risk_assessment_test.py  # Risk checks with a legacy dependency
-│   └── test_api.py              # API validation and response checks
 ├── tools/
-│   ├── __init__.py
-│   ├── equipment.py             # Equipment-detail and maintenance-history tools
-│   └── work_orders_db.py        # SQLite work-order storage helper
-├── .env                        # Local configuration; Git-ignored
-├── .example.env                # Example environment configuration
+│   ├── equipment_db.py          # Shared equipment and operational sample records
+│   ├── equipment_tools.py       # Equipment-detail and maintenance-history tools
+│   └── work_orders.py           # In-memory work-order creation and deduplication
+├── .example.env                # Example environment variable configuration
 ├── .gitignore
-├── pyproject.toml              # Python version and dependency definitions
+├── main.py                     # Interactive multi-turn CLI
+├── pyproject.toml              # Python requirements and dependencies
 ├── README.md
-├── schemas.py                  # Structured classification schema
-├── state.py                    # Parent state, including clarification fields
-├── supervisor.py               # Clarification, classification, routing, adapters
-└── uv.lock                     # Locked dependency versions
+├── request_validation.py       # Clarification, classification, validation, adapters
+├── schemas.py                  # Input, intent, clarification, approval schemas
+├── state.py                    # Shared parent State schema
+└── supervisor.py               # Graph assembly and final response composition
 ```
 
-## 🚀 Run the API
+## 🚀 Run the API or CLI
 
 ### 1. Prepare the environment
 
@@ -367,28 +381,19 @@ Use **Python 3.12+** and **uv**. From PowerShell:
 
 ```powershell
 Set-Location "C:\Users\Admin\Desktop\Ultimate LangGraph Agent"
-uv sync --locked
+uv sync
+$env:OPENAI_API_KEY = "your_openai_api_key_here"
 ```
 
-Create or update a local `.env` file with your OpenAI API key:
+Set `OPENAI_API_KEY` in the terminal that will launch the application. The model is configured as `gpt-5-mini` in the request-handling module and Equipment Agent.
 
-```dotenv
-OPENAI_API_KEY=your_openai_api_key_here
-```
-
-The supervisor loads this file with `python-dotenv` and uses `gpt-5-mini` for classification.
-
-> 📌 **Current checkout dependency:** `supervisor.py` still imports `old.schemas` and `old.state`, and `agents/maintenance_action.py` imports `old.work_orders`. Those imports must resolve for the API to start. The excluded folder was not inspected for this README; the documented files alone are not yet a standalone runtime.
-
-### 2. Start the server
-
-From the project root, with the current import dependencies available:
+### 2. Start the API
 
 ```powershell
 uv run uvicorn api.main:app --host 127.0.0.1 --port 8000
 ```
 
-Keep this terminal running while invoking the API from a second terminal. Keep the same server process running between submitting a proposal and approving it.
+Keep this server process running while sending messages and approval decisions from a second terminal. Workflow state and work orders are held in memory.
 
 | Resource | Address |
 |---|---|
@@ -396,6 +401,14 @@ Keep this terminal running while invoking the API from a second terminal. Keep t
 | Interactive Swagger documentation | [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs) |
 | ReDoc documentation | [http://127.0.0.1:8000/redoc](http://127.0.0.1:8000/redoc) |
 | OpenAPI schema | [http://127.0.0.1:8000/openapi.json](http://127.0.0.1:8000/openapi.json) |
+
+### 3. Or use the interactive CLI
+
+```powershell
+uv run python main.py
+```
+
+Enter a request, answer any clarification question, and use `approve` or `reject` when prompted. Type `quit` or `exit` to end the session. The CLI and API are separate processes with separate in-memory stores.
 
 ---
 
@@ -405,11 +418,12 @@ Keep this terminal running while invoking the API from a second terminal. Keep t
 |---|---|---|
 | `POST` | `/requests` | Start a workflow; return a completed response or an approval interrupt. |
 | `POST` | `/requests/stream` | Start a workflow and stream parent graph updates as Server-Sent Events. |
+| `POST` | `/threads/{thread_id}/messages` | Send a follow-up or clarification reply on an existing thread. |
 | `POST` | `/threads/{thread_id}/approvals` | Resume a paused workflow with approval, rejection, or edits. |
 | `GET` | `/threads/{thread_id}` | Inspect stored parent state and the next scheduled nodes. |
 | `GET` | `/health` | Check whether the API process is responding. |
 
-**Request body:** `/requests` and `/requests/stream` accept a `message` string containing **1–2,000 characters**. Each submission creates a new thread; `/requests` does not append follow-up messages to an existing thread. The new supervisor clarification resolver therefore has no same-thread message endpoint yet.
+**Request body:** `/requests`, `/requests/stream`, and `/threads/{thread_id}/messages` accept a `message` string containing **1–2,000 characters**. The first two create new threads; the message endpoint continues an existing thread. Use messages for clarification replies and references such as “that machine.”
 
 **Workflow statuses:** `completed` means the workflow returned a final response, including clarification or rejection. `awaiting_approval` means the workflow paused and requires a decision on the supplied thread ID.
 
@@ -423,13 +437,13 @@ Keep this terminal running while invoking the API from a second terminal. Keep t
 
 Use `edit` to apply changes, then approve the revised proposal in a separate call. Unknown fields inside `changes` are rejected. The API supplies `reviewer_id` internally as `demo-supervisor`.
 
-**HTTP errors:** Request-schema validation failures return `422`; an unknown thread on state inspection returns `404`; submitting approval when no approval interrupt is pending returns `409`.
+**HTTP errors:** Request-schema validation failures return `422`. An unknown thread on state inspection or message submission returns `404`. Messages submitted during a pending approval return `409`; use the approval endpoint instead. Approval submission without a pending approval interrupt also returns `409`.
 
 > 📡 **Streaming behavior:** `/requests/stream` emits `data: <JSON>` frames containing node updates rather than model tokens. It does not currently expose the generated thread ID to the client or use the regular completed/approval response envelope. Use `/requests` for the approval workflow below.
 
 ## 💻 How to Invoke the API Using PowerShell
 
-With the server running, open a **second PowerShell terminal**. These responses illustrate code-defined behavior; generated IDs will vary.
+With the server running, open a **second PowerShell terminal**. These examples show response shapes rather than recorded executions. Generated IDs and model-written wording will vary.
 
 ### ⚙️ Ask for equipment status
 
@@ -447,15 +461,72 @@ $response = Invoke-RestMethod `
 $response
 ```
 
-Expected response shape:
+Illustrative response shape; equipment wording is model-generated:
 
 ```json
 {
   "thread_id": "generated-uuid",
   "status": "completed",
-  "response": "Machine M-103 has status 'Maintenance Required' and requires maintenance review."
+  "response": "M-103 is a CNC Milling Machine with status Maintenance Required and a temperature of 85.5°C."
 }
 ```
+
+### 💬 Continue the same conversation
+
+After the equipment request above, retain its thread ID and ask about the same machine:
+
+```powershell
+$threadId = $response.thread_id
+
+$body = @{
+    message = "Show its maintenance history."
+} | ConvertTo-Json
+
+$response = Invoke-RestMethod `
+    -Uri "http://127.0.0.1:8000/threads/$threadId/messages" `
+    -Method Post `
+    -ContentType "application/json" `
+    -Body $body
+
+$response
+```
+
+The classifier receives recent machine context, and the Equipment Agent can call `get_maintenance_history`. Reference resolution and tool selection are model-driven.
+
+### ❓ Answer a clarification question
+
+Start a request that is missing a machine ID:
+
+```powershell
+$body = @{
+    message = "Show me a machine's maintenance history."
+} | ConvertTo-Json
+
+$response = Invoke-RestMethod `
+    -Uri "http://127.0.0.1:8000/requests" `
+    -Method Post `
+    -ContentType "application/json" `
+    -Body $body
+
+$threadId = $response.thread_id
+$response.response
+```
+
+Reply on that same thread:
+
+```powershell
+$body = @{
+    message = "For machine M-103."
+} | ConvertTo-Json
+
+Invoke-RestMethod `
+    -Uri "http://127.0.0.1:8000/threads/$threadId/messages" `
+    -Method Post `
+    -ContentType "application/json" `
+    -Body $body
+```
+
+The resolver extracts the missing information and sends the restored task through validation. An answer that still lacks required details can lead to another question.
 
 ### 🔎 Start an investigation
 
@@ -502,7 +573,7 @@ Expected response shape:
       "machine_id": "M-103",
       "issue": "Inspect the cooling system",
       "priority": "high",
-      "action": "Inspect and repair the cooling system.",
+      "action": "Inspect and repair.",
       "estimated_minutes": 120
     },
     "allowed_actions": ["approve", "reject", "edit"]
@@ -623,9 +694,11 @@ This reports API process health; it does not check OpenAI connectivity or work-o
 | Investigate recurring overheating | “Investigate why M-103 keeps overheating.” | Investigation |
 | Investigate output loss | “Investigate production losses on M-103.” | Investigation |
 | Propose maintenance | “Create a high-priority work order for M-103 to inspect the cooling system.” | Action → human approval |
-| Request without a machine ID | “Check the machine.” | Clarification path; wiring in progress |
+| Request without a machine ID | “Check the machine.” | Clarification |
+| Retrieve service records | “Show maintenance history for M-104.” | Equipment tool loop |
+| Refer to the last machine | “Show its maintenance history.” | Existing-thread message → equipment |
 
-Classification is model-driven, so these are expected routes rather than guaranteed classifier results. An investigation reads all four evidence sources regardless of which symptom is mentioned.
+Classification is model-driven, so these are expected routes rather than guaranteed classifier results. Send context-dependent prompts through the existing-thread message endpoint or CLI. An investigation reads all four evidence sources regardless of the symptom mentioned.
 
 ## 🚀 Agent Optimization Techniques
 
@@ -665,12 +738,12 @@ For a business-facing evaluation, measure task quality alongside **resolution ti
 
 ## 📌 Current Implementation Notes
 
-- **Local sample records:** Equipment and investigation branches read in-code dictionaries rather than live plant systems.
-- **Clarification in progress:** The new state fields and resolver are documented above; missing-field handling, intent preservation, state imports, flag reset, and same-thread HTTP follow-ups still need wiring.
-- **Single intent per request:** The supervisor does not decompose a combined request into multiple specialist tasks. Submit status, investigation, and action requests separately.
-- **In-memory checkpoints:** Pending approvals and inspectable thread state are lost on server restart. The installed SQLite checkpoint package is not the active checkpointer.
-- **Work-order storage wiring:** `tools/work_orders_db.py` provides a SQLite helper with request-ID deduplication using a primary key and `INSERT OR IGNORE`. The active action subgraph imports creation from the excluded legacy module instead, so this helper's durable/idempotent behavior is not established for the active API path.
-- **Tool wiring:** `tools/equipment.py` defines equipment-detail and maintenance-history tools, but the current equipment subgraph uses its own lookup and summary nodes. Maintenance-history retrieval is not connected to that route.
-- **Approval identity:** The API currently uses the fixed reviewer `demo-supervisor`; authenticated reviewer identity is not implemented.
+- **Sample operational data:** Equipment tools and investigation branches read the shared dictionaries in `tools/equipment_db.py`, rather than live plant systems.
+- **Single specialist intent per turn:** The supervisor does not decompose a combined request into several tasks. Use separate turns for status, investigation, and action requests.
+- **Process-local storage:** Server restarts clear workflow checkpoints and work orders. Separate API workers or CLI processes do not share state.
+- **Request-scoped deduplication:** The work-order tool prevents repeated creation for the same request ID within a process. It does not detect identical requests submitted under different IDs or provide durable duplicate prevention.
+- **Investigation edge cases:** The incident formatter calls `.lower()` on `incident_type`, which is `None` for M-104 and M-105. It also uses a fixed “Two recent” phrase rather than the stored count. Unknown investigation IDs use direct dictionary indexing. Use M-103 for the documented investigation path until these cases are handled.
+- **Approval identity:** HTTP approvals use the fixed reviewer `demo-supervisor`; the CLI supplies `local-tester`. Authenticated reviewer identity is not implemented.
+- **Model-dependent behavior:** Intent extraction, clarification extraction, recent-machine references, equipment tool selection, and equipment answer wording depend on LLM output.
 
-The diagrams and examples describe the inspected application flow and supplied reference images. They do not represent a recorded end-to-end execution.
+The README reflects inspected source code. The retained design images are reference material, and the examples do not claim a recorded end-to-end execution or measured optimization gains.
